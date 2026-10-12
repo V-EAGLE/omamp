@@ -201,7 +201,8 @@ Item {
     pickedKey = key
   }
 
-  onActiveKeyChanged: if (activeKey) lastActiveKey = activeKey
+  // Deferred: writing it while activeSource is evaluating would loop.
+  onActiveKeyChanged: Qt.callLater(function() { if (root.activeKey) root.lastActiveKey = root.activeKey })
 
   // Record when each source started playing (newest wins auto-selection).
   function syncPlayOrder() {

@@ -50,7 +50,12 @@ appears under its own name.
   - The active source at the top; click it to switch between sources.
   - Cover art, title, a draggable timeline (scroll to seek), and
     shuffle / previous / play-pause / next / repeat.
-  - Apple Music: the next three songs (click one to jump to it).
+  - Apple Music: Up Next shows three songs at a time; scroll (mouse wheel,
+    scrollbar, or the keys below) to see the rest of the queue, and click a
+    song to jump to it.
+  - Keys while the popup is open: <kbd>↑</kbd>/<kbd>↓</kbd> scroll Up Next by
+    one song, <kbd>PgUp</kbd>/<kbd>PgDn</kbd> by three, <kbd>Home</kbd>/<kbd>End</kbd>
+    to the start/end, <kbd>Space</kbd> play/pause, <kbd>Esc</kbd> close.
   - Nothing playing: buttons to open Apple Music, Spotify, Tidal, Amazon Music,
     Audible or YouTube Music.
 - **Pop-out player** (right-click, or the ⤢ button in the popup):

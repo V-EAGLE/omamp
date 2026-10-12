@@ -115,7 +115,8 @@ BarWidget {
 
   // ------------------------------------------------------------ slim popup
 
-  PopupCard {
+  // KeyboardPanel (not PopupCard) so the popup also takes keyboard input.
+  KeyboardPanel {
     id: popup
     anchorItem: root
     bar: root.bar
@@ -123,11 +124,28 @@ BarWidget {
     open: root.popupOpen
     contentWidth: popup.fittedContentWidth(Style.space(300))
     contentHeight: popup.fittedContentHeight(content.implicitHeight)
+    focusTarget: content
 
     Column {
       id: content
       width: parent.width
       spacing: Style.space(10)
+      focus: true
+
+      // ↑/↓ PgUp/PgDn Home/End scroll Up Next, Space plays/pauses, Esc closes.
+      Keys.onPressed: function(event) {
+        var k = event.key
+        if (k === Qt.Key_Escape) root.close()
+        else if (k === Qt.Key_Space && root.am) root.am.playPause()
+        else if (k === Qt.Key_Up) upNextList.scrollRows(-1)
+        else if (k === Qt.Key_Down) upNextList.scrollRows(1)
+        else if (k === Qt.Key_PageUp) upNextList.scrollRows(-upNextList.visibleRows)
+        else if (k === Qt.Key_PageDown) upNextList.scrollRows(upNextList.visibleRows)
+        else if (k === Qt.Key_Home) upNextList.positionViewAtBeginning()
+        else if (k === Qt.Key_End) upNextList.positionViewAtEnd()
+        else return
+        event.accepted = true
+      }
 
       // header: active source (click to switch) + actions
       Item {
@@ -493,20 +511,46 @@ BarWidget {
 
       ListView {
         id: upNextList
+        // Three rows tall; the rest of the queue scrolls (wheel, scrollbar,
+        // or ↑/↓, PgUp/PgDn, Home/End while the popup is open).
+        readonly property real rowHeight: Style.space(34)
+        readonly property real rowStep: rowHeight + spacing
+        readonly property int visibleRows: 3
         width: parent.width
-        height: contentHeight
-        interactive: false
+        height: Math.min(count, visibleRows) * rowHeight + Math.max(0, Math.min(count, visibleRows) - 1) * spacing
+        interactive: count > visibleRows
         clip: true
         spacing: Style.space(2)
         boundsBehavior: Flickable.StopAtBounds
-        model: root.am && root.am.hasQueue ? root.am.upNext.slice(0, 3) : []
+        snapMode: ListView.SnapToItem
+        model: root.am && root.am.hasQueue ? root.am.upNext : []
         visible: count > 0
+        ScrollBar.vertical: ScrollBar {
+          policy: upNextList.count > upNextList.visibleRows ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        }
+
+        function scrollRows(n) {
+          var maxY = Math.max(0, contentHeight - height)
+          contentY = Math.max(0, Math.min(maxY, contentY + n * rowStep))
+        }
+
+        // Start at the next song whenever the popup opens or the track changes.
+        Connections {
+          target: root
+          function onPopupOpenChanged() {
+            if (root.popupOpen) upNextList.positionViewAtBeginning()
+          }
+        }
+        Connections {
+          target: root.am
+          function onQueuePositionChanged() { upNextList.positionViewAtBeginning() }
+        }
 
         delegate: Rectangle {
           id: rowItem
           required property var modelData
           width: upNextList.width
-          height: Style.space(34)
+          height: upNextList.rowHeight
           radius: Style.spacing.labelGap
           color: rowHover.hovered ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
 
