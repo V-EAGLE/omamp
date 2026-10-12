@@ -14,6 +14,8 @@ Item {
   property color fillColor: Color.foreground
   property color knobColor: fillColor
   property real trackHeight: 4
+  // false for players that can't seek: the bar still shows progress.
+  property bool seekable: true
   property bool showKnob: hover.hovered || dragging
 
   readonly property bool dragging: mouse.pressed
@@ -30,7 +32,7 @@ Item {
     return duration > 0 ? Math.max(0, Math.min(1, x / width)) * duration : 0
   }
 
-  HoverHandler { id: hover; cursorShape: root.duration > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor }
+  HoverHandler { id: hover; cursorShape: root.seekable && root.duration > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor }
 
   Rectangle {
     id: track
@@ -57,14 +59,14 @@ Item {
     color: root.knobColor
     anchors.verticalCenter: parent.verticalCenter
     x: Math.round(root.progress * root.width - width / 2)
-    opacity: root.showKnob && root.duration > 0 ? 1 : 0
+    opacity: root.showKnob && root.seekable && root.duration > 0 ? 1 : 0
     Behavior on opacity { NumberAnimation { duration: 120 } }
   }
 
   MouseArea {
     id: mouse
     anchors.fill: parent
-    enabled: root.duration > 0
+    enabled: root.seekable && root.duration > 0
     preventStealing: true
     onPressed: function(e) { root.dragPosition = root.posAt(e.x) }
     onPositionChanged: function(e) { if (pressed) root.dragPosition = root.posAt(e.x) }

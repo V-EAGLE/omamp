@@ -18,7 +18,20 @@ BarWidget {
   readonly property real maxLabelWidth: setting("maxLabelWidth", 180)
 
   property bool popupOpen: false
-  function close() { popupOpen = false }
+  property bool sourceMenuOpen: false
+  function close() { popupOpen = false; sourceMenuOpen = false }
+
+  // Apple Music can be switched off per widget (`appleMusic` setting).
+  Binding {
+    target: root.am
+    property: "appleEnabled"
+    value: root.setting("appleMusic", true) !== false
+    when: root.am !== null
+  }
+
+  readonly property bool appleConnecting: am ? (am.isApple && am.appleEnabled && am.browser && !am.connected) : false
+  readonly property bool appleSignIn: am ? (am.isApple && am.connected && !am.authorized) : false
+  readonly property bool showPlayer: am ? (am.hasTrack || (am.isApple && am.appleLive)) : false
 
   function popOut() {
     popupOpen = false
@@ -31,6 +44,10 @@ BarWidget {
     target: "omamp"
     function togglePopup(): void { root.popupOpen = !root.popupOpen }
     function openPlayer(): void { root.popOut() }
+    function playPause(): void { if (root.am) root.am.playPause() }
+    function next(): void { if (root.am) root.am.next() }
+    function previous(): void { if (root.am) root.am.previous() }
+    function seekBy(seconds: string): void { if (root.am) root.am.seek(root.am.livePosition + Number(seconds)) }
   }
 
   implicitWidth: row.implicitWidth + Style.space(14)
@@ -92,7 +109,7 @@ BarWidget {
       else if (mouse.button === Qt.RightButton) root.popOut()
       else root.popupOpen = !root.popupOpen
     }
-    onEntered: if (root.bar) root.bar.showTooltip(root, root.hasTrack ? root.am.title + " — " + root.am.artist : "OmAmp")
+    onEntered: if (root.bar) root.bar.showTooltip(root, root.hasTrack ? root.am.title + " — " + root.am.artist + "  (" + root.am.sourceName + ")" : "OmAmp")
     onExited: if (root.bar) root.bar.hideTooltip(root)
   }
 
@@ -112,19 +129,34 @@ BarWidget {
       width: parent.width
       spacing: Style.space(10)
 
-      // header
+      // header: active source (click to switch) + actions
       Item {
         width: parent.width
-        height: Math.max(headerLabel.implicitHeight, popBtn.implicitHeight)
+        height: Math.max(sourceButton.implicitHeight, popBtn.implicitHeight)
 
-        Text {
-          id: headerLabel
+        Rectangle {
+          id: sourceButton
+          readonly property bool switchable: root.am && root.am.sources.length > 1
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
-          text: "󰝚  OmAmp"
-          color: root.dim
-          font.family: root.iconFont
-          font.pixelSize: Style.font.caption
+          implicitWidth: headerLabel.implicitWidth + Style.space(12)
+          implicitHeight: headerLabel.implicitHeight + Style.space(6)
+          radius: Style.spacing.labelGap
+          color: switchable && headerHover.hovered ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+
+          Text {
+            id: headerLabel
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: (root.am ? root.am.sourceGlyph + "  " + root.am.sourceName : "󰝚  OmAmp")
+              + (sourceButton.switchable ? (root.sourceMenuOpen ? "  󰅃" : "  󰅀") : "")
+            color: root.dim
+            font.family: root.iconFont
+            font.pixelSize: Style.font.caption
+          }
+
+          HoverHandler { id: headerHover; cursorShape: sourceButton.switchable ? Qt.PointingHandCursor : Qt.ArrowCursor }
+          TapHandler { onTapped: if (sourceButton.switchable) root.sourceMenuOpen = !root.sourceMenuOpen }
         }
 
         Row {
@@ -134,12 +166,12 @@ BarWidget {
 
           Button {
             iconText: "󰖟"
-            tooltipText: "Show web player"
+            tooltipText: root.am && root.am.isApple ? "Show web player" : "Show player"
             foreground: root.fg
             horizontalPadding: Style.spacing.sm
             verticalPadding: Style.spacing.xxs
-            visible: root.am && root.am.connected
-            onClicked: { root.popupOpen = false; root.am.showWeb() }
+            visible: root.am && root.am.canShowSource
+            onClicked: { root.close(); root.am.showSource() }
           }
 
           Button {
@@ -154,11 +186,80 @@ BarWidget {
         }
       }
 
-      // not running / not signed in
+      // source picker
+      Column {
+        width: parent.width
+        spacing: Style.space(2)
+        visible: root.sourceMenuOpen
+
+        Repeater {
+          model: root.am ? root.am.sources : []
+
+          Rectangle {
+            id: srcRow
+            required property var modelData
+            readonly property bool selected: root.am && root.am.activeKey === modelData.key
+            width: parent.width
+            height: Style.space(36)
+            radius: Style.spacing.labelGap
+            color: selected ? Style.selectedFillFor(root.fg, Color.accent)
+              : (srcHover.hovered ? Style.hoverFillFor(root.fg, Color.accent) : "transparent")
+
+            HoverHandler { id: srcHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler { onTapped: { root.am.selectSource(srcRow.modelData.key); root.sourceMenuOpen = false } }
+
+            Text {
+              id: srcGlyph
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(18)
+              horizontalAlignment: Text.AlignHCenter
+              text: srcRow.modelData.glyph
+              color: srcRow.modelData.playing ? Color.accent : root.fg
+              font.family: root.iconFont
+              font.pixelSize: Style.font.body
+            }
+
+            Column {
+              anchors.left: srcGlyph.right
+              anchors.leftMargin: Style.space(8)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: srcRow.modelData.name + (srcRow.modelData.playing ? "  󰝚" : "")
+                color: root.fg
+                font.family: root.iconFont
+                font.pixelSize: Style.font.bodySmall
+                font.bold: srcRow.selected
+                elide: Text.ElideRight
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: srcRow.modelData.title + (srcRow.modelData.artist ? " — " + srcRow.modelData.artist : "")
+                color: root.dim
+                font.family: root.iconFont
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                visible: text !== ""
+              }
+            }
+          }
+        }
+
+        PanelSeparator { foreground: root.fg }
+      }
+
+      // Apple: connecting / sign-in
       Column {
         width: parent.width
         spacing: Style.space(8)
-        visible: !root.am || !root.am.connected || !root.am.authorized
+        visible: root.appleConnecting || root.appleSignIn
 
         Text {
           width: parent.width
@@ -167,21 +268,60 @@ BarWidget {
           color: root.fg
           font.family: root.iconFont
           font.pixelSize: Style.font.body
-          text: !root.am || !root.am.connected
-            ? (root.am && root.am.browser ? "Connecting to Apple Music…" : "Apple Music is not running.")
-            : "Sign in to Apple Music in the web player."
+          text: root.appleSignIn ? "Sign in to Apple Music in the web player." : "Connecting to Apple Music…"
         }
 
         Button {
           anchors.horizontalCenter: parent.horizontalCenter
-          text: !root.am || !root.am.connected ? "Start Apple Music" : "Sign in"
+          text: "Sign in"
           bordered: true
           foreground: root.fg
-          visible: !root.am || !root.am.browser || (root.am.connected && !root.am.authorized)
-          onClicked: {
-            if (!root.am) return
-            if (!root.am.connected) root.am.launch(true)
-            else { root.popupOpen = false; root.am.showWeb() }
+          visible: root.appleSignIn
+          onClicked: { root.close(); root.am.showWeb() }
+        }
+      }
+
+      // nothing playing: open a service
+      Column {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: !root.showPlayer && !root.appleConnecting && !root.appleSignIn
+
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          color: root.fg
+          font.family: root.iconFont
+          font.pixelSize: Style.font.body
+          text: "Nothing playing"
+        }
+
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.WordWrap
+          color: root.dim
+          font.family: root.iconFont
+          font.pixelSize: Style.font.caption
+          text: "Start music in any player, or open a service:"
+        }
+
+        Flow {
+          width: parent.width
+          spacing: Style.space(4)
+
+          Repeater {
+            model: root.am ? root.am.launchers.filter(function(l) { return l.visible !== false }) : []
+
+            Button {
+              required property var modelData
+              text: modelData.glyph + "  " + modelData.name
+              bordered: true
+              foreground: root.fg
+              horizontalPadding: Style.spacing.md
+              verticalPadding: Style.spacing.xs
+              onClicked: { root.am.openService(modelData.key); if (modelData.key !== "apple") root.close() }
+            }
           }
         }
       }
@@ -191,8 +331,9 @@ BarWidget {
         anchors.horizontalCenter: parent.horizontalCenter
         width: Math.round(parent.width * 0.25)
         height: width
-        visible: root.am && root.am.connected && root.am.authorized
+        visible: root.showPlayer
         source: root.am ? root.am.artUrl : ""
+        glyph: root.am ? root.am.sourceGlyph : "󰝚"
         radius: Math.max(6, Style.cornerRadius)
         placeholderColor: Style.normalFillFor(root.fg, Color.accent)
         glyphColor: root.dim
@@ -203,7 +344,7 @@ BarWidget {
       Column {
         width: parent.width
         spacing: Style.space(2)
-        visible: root.am && root.am.connected && root.am.authorized
+        visible: root.showPlayer
 
         Text {
           width: parent.width
@@ -245,13 +386,14 @@ BarWidget {
       Column {
         width: parent.width
         spacing: Style.space(2)
-        visible: root.am && root.am.connected && root.am.authorized
+        visible: root.showPlayer && root.am.duration > 0
 
         Timeline {
           id: timeline
           width: parent.width
           position: root.am ? root.am.livePosition : 0
           duration: root.am ? root.am.duration : 0
+          seekable: root.am ? root.am.canSeek : false
           trackColor: Style.selectedFillFor(root.fg, Color.accent)
           fillColor: root.fg
           onSeekRequested: function(t) { root.am.seek(t) }
@@ -284,12 +426,13 @@ BarWidget {
       Row {
         anchors.horizontalCenter: parent.horizontalCenter
         spacing: Style.space(6)
-        visible: root.am && root.am.connected && root.am.authorized
+        visible: root.showPlayer
 
         Button {
           anchors.verticalCenter: parent.verticalCenter
           iconText: "󰒟"
           tooltipText: "Shuffle"
+          visible: root.am && root.am.canShuffle
           foreground: root.am && root.am.shuffle ? Color.accent : root.dim
           onClicked: root.am.setShuffle(root.am.shuffle ? 0 : 1)
         }
@@ -299,6 +442,8 @@ BarWidget {
           iconText: "󰒮"
           foreground: root.fg
           iconSize: Style.font.iconLarge
+          enabled: root.am && root.am.canPrevious
+          opacity: enabled ? 1 : 0.4
           onClicked: root.am.previous()
         }
 
@@ -316,6 +461,8 @@ BarWidget {
           iconText: "󰒭"
           foreground: root.fg
           iconSize: Style.font.iconLarge
+          enabled: root.am && root.am.canNext
+          opacity: enabled ? 1 : 0.4
           onClicked: root.am.next()
         }
 
@@ -323,6 +470,7 @@ BarWidget {
           anchors.verticalCenter: parent.verticalCenter
           iconText: root.am && root.am.repeat === 1 ? "󰑘" : "󰑖"
           tooltipText: "Repeat"
+          visible: root.am && root.am.canRepeat
           foreground: root.am && root.am.repeat ? Color.accent : root.dim
           onClicked: root.am.cycleRepeat()
         }
@@ -351,7 +499,7 @@ BarWidget {
         clip: true
         spacing: Style.space(2)
         boundsBehavior: Flickable.StopAtBounds
-        model: root.am && root.am.connected ? root.am.upNext.slice(0, 3) : []
+        model: root.am && root.am.hasQueue ? root.am.upNext.slice(0, 3) : []
         visible: count > 0
 
         delegate: Rectangle {

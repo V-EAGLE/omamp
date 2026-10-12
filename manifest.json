@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "io.github.v-eagle.omamp",
   "name": "OmAmp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "Vincenz Adler",
-  "description": "OmAmp — Apple Music in the bar: now playing, controls, up next, and a full pop-out player",
+  "description": "OmAmp — a music player for the Omarchy bar: works with any MPRIS player (Spotify, Tidal, Amazon Music, Audible, YouTube Music, web players…) and adds queue, library and search for Apple Music",
   "kinds": [
     "service",
     "bar-widget",
@@ -18,12 +18,13 @@
   },
   "barWidget": {
     "displayName": "OmAmp",
-    "description": "Now playing, controls, timeline and up next; pops out into a full player",
+    "description": "Now playing, controls, timeline and source switching for any player; Up Next and a full library for Apple Music",
     "category": "Media",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "maxLabelWidth": 180
+      "maxLabelWidth": 180,
+      "appleMusic": true
     },
     "schema": [
       {
@@ -34,6 +35,12 @@
         "max": 600,
         "step": 10,
         "defaultValue": 180
+      },
+      {
+        "key": "appleMusic",
+        "type": "boolean",
+        "label": "Apple Music integration (queue, library, search)",
+        "defaultValue": true
       }
     ]
   },

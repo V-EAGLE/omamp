@@ -439,6 +439,30 @@ def launch_browser():
     return True
 
 
+def browser_pid():
+    """PID of the Chromium main process serving the DevTools port (0 if none).
+
+    Chromium names its MPRIS service org.mpris.MediaPlayer2.chromium.instance<PID>,
+    which lets the shell hide OmAmp's own browser from the generic sources.
+    """
+    flag = f"--remote-debugging-port={PORT}".encode()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        # Chromium rewrites its argv into one space-separated string.
+        if flag not in raw or b"--type=" in raw:
+            continue
+        exe = os.path.basename(raw.replace(b"\0", b" ").split(b" ", 1)[0])
+        if b"chrom" in exe or b"brave" in exe:
+            return int(entry)
+    return 0
+
+
 def widevine_downloaded():
     # Chromium's component updater fetches Widevine into the profile after the
     # first start, but only loads a CDM at browser startup.
@@ -496,9 +520,11 @@ class Bridge:
         self.drm = None
         self.drm_checked_at = 0
         self.drm_restarted = False
+        self.pid = 0
 
     def set_status(self, **kw):
-        status = {"type": "status", "browser": False, "connected": False, "ready": False, "authorized": False, "drm": None}
+        status = {"type": "status", "browser": False, "connected": False, "ready": False, "authorized": False, "drm": None,
+                  "pid": self.pid if kw.get("connected") else 0}
         status.update(kw)
         if status != self.status:
             self.status = status
@@ -520,6 +546,7 @@ class Bridge:
         try:
             self.ws = WebSocket(page["webSocketDebuggerUrl"])
             self.ws.sock.settimeout(20)
+            self.pid = browser_pid()
         except (OSError, ConnectionError) as e:
             emit({"type": "error", "message": f"connect failed: {e}"})
             self.ws = None

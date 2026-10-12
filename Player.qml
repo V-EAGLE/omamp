@@ -14,7 +14,8 @@ Item {
   property var manifest: null
 
   readonly property var am: service
-  readonly property bool live: am && am.connected && am.authorized
+  // Apple Music pages need a signed-in Apple source.
+  readonly property bool live: !!(am && am.appleLive)
 
   // ---- palette (Apple Music dark)
   readonly property color accent: Color.accent
@@ -42,8 +43,10 @@ Item {
     if (live && typeof p.search === "string" && p.search !== "") {
       searchField.text = p.search
       doSearch(p.search)
-    } else if (live && p.nav && typeof p.nav.view === "string") {
+    } else if (p.nav && typeof p.nav.view === "string" && (live || p.nav.view === "nowplaying")) {
       navigate(p.nav)
+    } else if (am && (!am.isApple || !am.appleEnabled) && nav.view !== "nowplaying") {
+      navigate({ view: "nowplaying" })
     }
   }
 
@@ -56,7 +59,7 @@ Item {
 
   // ---- navigation / data
   property bool initialized: false
-  property var nav: ({ view: "home" })
+  property var nav: ({ view: "nowplaying" })
   property var navHistory: []
   property var sections: []
   property bool loading: false
@@ -71,6 +74,7 @@ Item {
   function initialize() {
     initialized = true
     loadPlaylists()
+    if (nav.view === "nowplaying" && am.isApple) nav = { view: "home" }
     load(nav)
   }
 
@@ -119,6 +123,7 @@ Item {
       return
     }
     sections = n.view === "search" ? build(n, null) : []
+    if (n.view === "nowplaying") { loading = false; return }
     if (!live) return
     loading = true
     var cmd, args
@@ -403,19 +408,35 @@ Item {
             width: sideFlick.width
             spacing: 2
 
-            T { text: "Apple Music"; leftPadding: 22; topPadding: 14; bottomPadding: 4; secondary: true; font.pixelSize: 11; font.weight: Font.DemiBold }
-            SideItem { glyph: "󰋜"; label: "Home"; property var target: ({ view: "home" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
-
-            T { text: "Library"; leftPadding: 22; topPadding: 14; bottomPadding: 4; secondary: true; font.pixelSize: 11; font.weight: Font.DemiBold }
-            SideItem { glyph: "󰅐"; label: "Recently Added"; property var target: ({ view: "library", section: "recent" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
-            SideItem { glyph: "󰠃"; label: "Artists"; property var target: ({ view: "library", section: "artists" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
-            SideItem { glyph: "󰀥"; label: "Albums"; property var target: ({ view: "library", section: "albums" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
-            SideItem { glyph: "󰎈"; label: "Songs"; property var target: ({ view: "library", section: "songs" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
-
-            T { text: "Playlists"; visible: root.playlists.length > 0; leftPadding: 22; topPadding: 14; bottomPadding: 4; secondary: true; font.pixelSize: 11; font.weight: Font.DemiBold }
-            SideItem { glyph: "󰕰"; label: "All Playlists"; property var target: ({ view: "library", section: "playlists" }); visible: root.playlists.length > 0; x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
+            T { text: "Now Playing"; leftPadding: 22; topPadding: 4; bottomPadding: 4; secondary: true; font.pixelSize: 11; font.weight: Font.DemiBold }
             Repeater {
-              model: root.playlists
+              model: root.am ? root.am.sources : []
+              SideItem {
+                required property var modelData
+                x: 10
+                width: sideCol.width - 20
+                glyph: modelData.glyph
+                label: modelData.name + (modelData.playing ? "  󰝚" : "")
+                accent: root.accent
+                glyphFont: root.iconFont
+                selected: root.am.activeKey === modelData.key && root.nav.view === "nowplaying"
+                onActivated: { root.am.selectSource(modelData.key); root.navigate({ view: "nowplaying" }) }
+              }
+            }
+
+            T { text: "Apple Music"; visible: root.am && root.am.appleEnabled; leftPadding: 22; topPadding: 14; bottomPadding: 4; secondary: true; font.pixelSize: 11; font.weight: Font.DemiBold }
+            SideItem { glyph: "󰋜"; label: "Home"; visible: root.am && root.am.appleEnabled; property var target: ({ view: "home" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
+
+            T { text: "Library"; visible: root.am && root.am.appleEnabled; leftPadding: 22; topPadding: 14; bottomPadding: 4; secondary: true; font.pixelSize: 11; font.weight: Font.DemiBold }
+            SideItem { glyph: "󰅐"; label: "Recently Added"; visible: root.am && root.am.appleEnabled; property var target: ({ view: "library", section: "recent" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
+            SideItem { glyph: "󰠃"; label: "Artists"; visible: root.am && root.am.appleEnabled; property var target: ({ view: "library", section: "artists" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
+            SideItem { glyph: "󰀥"; label: "Albums"; visible: root.am && root.am.appleEnabled; property var target: ({ view: "library", section: "albums" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
+            SideItem { glyph: "󰎈"; label: "Songs"; visible: root.am && root.am.appleEnabled; property var target: ({ view: "library", section: "songs" }); x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
+
+            T { text: "Playlists"; visible: root.playlists.length > 0 && root.am.appleEnabled; leftPadding: 22; topPadding: 14; bottomPadding: 4; secondary: true; font.pixelSize: 11; font.weight: Font.DemiBold }
+            SideItem { glyph: "󰕰"; label: "All Playlists"; property var target: ({ view: "library", section: "playlists" }); visible: root.playlists.length > 0 && root.am.appleEnabled; x: 10; width: sideCol.width - 20; accent: root.accent; glyphFont: root.iconFont; selected: root.navKey(root.nav) === root.navKey(target); onActivated: root.navigate(target) }
+            Repeater {
+              model: root.am && root.am.appleEnabled ? root.playlists : []
               SideItem {
                 required property var modelData
                 readonly property var target: ({ view: "container", type: modelData.type, id: modelData.id })
@@ -448,7 +469,7 @@ Item {
             spacing: 4
             IconButton { size: 28; glyph: "󰁍"; glyphFont: root.iconFont; color: root.secondary; enabled: root.navHistory.length > 0; onClicked: root.back() }
             IconButton { size: 28; glyph: "󰑐"; glyphFont: root.iconFont; color: root.secondary; enabled: root.live; onClicked: root.refresh() }
-            IconButton { size: 28; glyph: "󰖟"; glyphFont: root.iconFont; color: root.secondary; onClicked: root.am.showWeb() }
+            IconButton { size: 28; glyph: "󰖟"; glyphFont: root.iconFont; color: root.secondary; enabled: root.am && root.am.canShowSource; onClicked: root.am.showSource() }
           }
         }
       }
@@ -476,11 +497,13 @@ Item {
             size: 30; glyph: "󰒟"; glyphFont: root.iconFont
             color: root.secondary
             active: root.am && root.am.shuffle !== 0
+            enabled: root.am && root.am.canShuffle
             onClicked: root.am.setShuffle(root.am.shuffle ? 0 : 1)
           }
           IconButton {
             anchors.verticalCenter: parent.verticalCenter
             size: 36; glyph: "󰒮"; glyphFont: root.iconFont
+            enabled: root.am && root.am.canPrevious
             onClicked: root.am.previous()
           }
           IconButton {
@@ -492,6 +515,7 @@ Item {
           IconButton {
             anchors.verticalCenter: parent.verticalCenter
             size: 36; glyph: "󰒭"; glyphFont: root.iconFont
+            enabled: root.am && root.am.canNext
             onClicked: root.am.next()
           }
           IconButton {
@@ -499,6 +523,7 @@ Item {
             size: 30; glyph: root.am && root.am.repeat === 1 ? "󰑘" : "󰑖"; glyphFont: root.iconFont
             color: root.secondary
             active: root.am && root.am.repeat !== 0
+            enabled: root.am && root.am.canRepeat
             onClicked: root.am.cycleRepeat()
           }
         }
@@ -523,7 +548,7 @@ Item {
             width: height
             radius: 0
             source: root.am ? root.am.artUrl : ""
-            glyph: "󰀵"
+            glyph: root.am ? root.am.sourceGlyph : "󰝚"
             glyphFont: root.iconFont
             placeholderColor: Util.alpha(Color.foreground, 0.1)
           }
@@ -540,7 +565,7 @@ Item {
             T {
               width: parent.width
               horizontalAlignment: Text.AlignHCenter
-              text: root.am && root.am.hasTrack ? root.am.title : (root.am && root.am.connected ? "" : "Apple Music")
+              text: root.am && root.am.hasTrack ? root.am.title : (root.am ? root.am.sourceName : "OmAmp")
               font.pixelSize: 13
               font.weight: Font.DemiBold
             }
@@ -585,6 +610,7 @@ Item {
             fillColor: Util.alpha(Color.foreground, 0.75)
             knobColor: Color.foreground
             showKnob: false
+            seekable: root.am ? root.am.canSeek : false
             onSeekRequested: function(t) { root.am.seek(t) }
           }
 
@@ -600,6 +626,7 @@ Item {
 
           Text {
             anchors.verticalCenter: parent.verticalCenter
+            visible: root.am && root.am.canVolume
             text: !root.am || root.am.volume <= 0.001 ? "󰝟" : (root.am.volume < 0.5 ? "󰖀" : "󰕾")
             color: root.secondary
             font.family: root.iconFont
@@ -619,6 +646,7 @@ Item {
             duration: 1
             wheelStep: 0.05
             position: root.am ? root.am.volume : 1
+            visible: root.am && root.am.canVolume
             trackColor: Util.alpha(Color.foreground, 0.2)
             fillColor: Util.alpha(Color.foreground, 0.75)
             onSeekRequested: function(v) { root.am.setVolume(v) }
@@ -629,6 +657,7 @@ Item {
             size: 32; glyph: "󰲸"; glyphFont: root.iconFont
             color: root.secondary
             active: root.queueOpen
+            visible: root.am && root.am.hasQueue
             onClicked: root.queueOpen = !root.queueOpen
           }
         }
@@ -667,7 +696,7 @@ Item {
           anchors.right: parent.right
           anchors.bottom: parent.bottom
           model: root.rows
-          visible: root.live
+          visible: root.live && root.nav.view !== "nowplaying"
           boundsBehavior: Flickable.StopAtBounds
           cacheBuffer: 800
           ScrollBar.vertical: ScrollBar {}
@@ -693,11 +722,175 @@ Item {
           }
         }
 
+        // Now Playing: works for every source (Apple or any MPRIS player).
+        Item {
+          id: nowPlaying
+          anchors.fill: parent
+          visible: root.nav.view === "nowplaying"
+
+          Column {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 80, 460)
+            spacing: 14
+            visible: root.am && root.am.hasTrack
+
+            CoverArt {
+              anchors.horizontalCenter: parent.horizontalCenter
+              width: Math.min(340, Math.max(160, nowPlaying.height * 0.42))
+              height: width
+              radius: 12
+              source: root.am ? root.am.artUrl : ""
+              glyph: root.am ? root.am.sourceGlyph : "󰝚"
+              glyphFont: root.iconFont
+            }
+
+            T {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              text: root.am ? root.am.title : ""
+              font.pixelSize: 24
+              font.weight: Font.Bold
+            }
+            T {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              secondary: true
+              font.pixelSize: 15
+              text: root.am ? root.am.artist + (root.am.album ? " — " + root.am.album : "") : ""
+              visible: text !== ""
+            }
+            Row {
+              anchors.horizontalCenter: parent.horizontalCenter
+              spacing: 6
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.am ? root.am.sourceGlyph : ""
+                color: root.accent
+                font.family: root.iconFont
+                font.pixelSize: 13
+              }
+              T {
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.am ? root.am.sourceName : ""
+                color: root.accent
+                font.pixelSize: 12
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: 4
+              visible: root.am && root.am.duration > 0
+              Timeline {
+                id: npTimeline
+                width: parent.width
+                position: root.am ? root.am.livePosition : 0
+                duration: root.am ? root.am.duration : 0
+                seekable: root.am ? root.am.canSeek : false
+                fillColor: root.accent
+                onSeekRequested: function(t) { root.am.seek(t) }
+              }
+              Item {
+                width: parent.width
+                height: 14
+                T { anchors.left: parent.left; secondary: true; font.pixelSize: 11; text: root.am ? root.am.formatTime(npTimeline.shownPosition) : "" }
+                T { anchors.right: parent.right; secondary: true; font.pixelSize: 11; text: root.am ? "-" + root.am.formatTime(Math.max(0, root.am.duration - npTimeline.shownPosition)) : "" }
+              }
+            }
+
+            Row {
+              anchors.horizontalCenter: parent.horizontalCenter
+              spacing: 14
+              IconButton {
+                anchors.verticalCenter: parent.verticalCenter
+                size: 36; glyph: "󰒟"; glyphFont: root.iconFont
+                color: root.secondary
+                visible: root.am && root.am.canShuffle
+                active: root.am && root.am.shuffle !== 0
+                onClicked: root.am.setShuffle(root.am.shuffle ? 0 : 1)
+              }
+              IconButton {
+                anchors.verticalCenter: parent.verticalCenter
+                size: 46; glyph: "󰒮"; glyphFont: root.iconFont
+                enabled: root.am && root.am.canPrevious
+                onClicked: root.am.previous()
+              }
+              IconButton {
+                anchors.verticalCenter: parent.verticalCenter
+                size: 64; glyphSize: 34
+                glyph: root.am && root.am.playing ? "󰏤" : "󰐊"; glyphFont: root.iconFont
+                filled: true
+                onClicked: root.am.playPause()
+              }
+              IconButton {
+                anchors.verticalCenter: parent.verticalCenter
+                size: 46; glyph: "󰒭"; glyphFont: root.iconFont
+                enabled: root.am && root.am.canNext
+                onClicked: root.am.next()
+              }
+              IconButton {
+                anchors.verticalCenter: parent.verticalCenter
+                size: 36; glyph: root.am && root.am.repeat === 1 ? "󰑘" : "󰑖"; glyphFont: root.iconFont
+                color: root.secondary
+                visible: root.am && root.am.canRepeat
+                active: root.am && root.am.repeat !== 0
+                onClicked: root.am.cycleRepeat()
+              }
+            }
+          }
+
+          // nothing playing: open a service
+          Column {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 80, 520)
+            spacing: 16
+            visible: !root.am || !root.am.hasTrack
+
+            Text {
+              anchors.horizontalCenter: parent.horizontalCenter
+              text: "󰝚"
+              color: root.accent
+              font.family: root.iconFont
+              font.pixelSize: 54
+            }
+            T {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              font.pixelSize: 18
+              font.weight: Font.DemiBold
+              text: root.am && root.am.isApple && root.am.connected && !root.am.authorized
+                ? "Sign in to Apple Music in the web player" : "Nothing playing"
+            }
+            T {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              wrapMode: Text.WordWrap
+              secondary: true
+              text: "Start music in any player that supports MPRIS — Spotify, tidal-hifi or a web player in your browser — or open a service:"
+            }
+            Flow {
+              width: parent.width
+              spacing: 10
+              Repeater {
+                model: root.am ? root.am.launchers.filter(function(l) { return l.visible !== false }) : []
+                PillButton {
+                  required property var modelData
+                  label: modelData.name
+                  glyph: modelData.glyph
+                  glyphFont: root.iconFont
+                  onClicked: modelData.key === "apple" && root.am.connected && !root.am.authorized
+                    ? root.am.showWeb() : root.am.openService(modelData.key)
+                }
+              }
+            }
+          }
+        }
+
         // status overlays
         Column {
           anchors.centerIn: parent
           spacing: 14
-          visible: !root.live || root.loading || root.errorText !== ""
+          visible: root.nav.view !== "nowplaying" && (!root.live || root.loading || root.errorText !== "")
           width: Math.min(parent.width - 80, 420)
 
           Text {
@@ -743,7 +936,7 @@ Item {
         anchors.right: parent.right
         anchors.top: playerBar.bottom
         anchors.bottom: parent.bottom
-        width: root.queueOpen ? 320 : 0
+        width: root.queueOpen && root.am && root.am.hasQueue ? 320 : 0
         color: root.sidebarBg
         clip: true
         Behavior on width { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
@@ -1061,7 +1254,7 @@ Item {
         showAlbum: !!sec.showAlbum && width > 640
         striped: row.index % 2 === 1
         current: root.isCurrent(row.item)
-        playing: root.am ? root.am.playing : false
+        playing: root.am ? root.am.applePlaying : false
         glyphFont: root.iconFont
         accent: root.accent
         durationText: root.am ? root.am.formatTime(row.item.duration || 0) : ""
