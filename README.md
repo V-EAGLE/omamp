@@ -1,4 +1,8 @@
-# OmAmp
+<p align="center">
+  <img src="omamp.svg" alt="OmAmp icon" width="128">
+</p>
+
+<h1 align="center">OmAmp</h1>
 
 Apple Music for the Omarchy bar. OmAmp puts the current song in your bar with a
 slim popup for quick control, and pops out into a full player that looks and
