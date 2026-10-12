@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.v-eagle.omamp",
+  "name": "OmAmp",
+  "version": "1.0.0",
+  "author": "Vincenz Adler",
+  "description": "OmAmp — Apple Music in the bar: now playing, controls, up next, and a full pop-out player",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Player.qml"
+  },
+  "barWidget": {
+    "displayName": "OmAmp",
+    "description": "Now playing, controls, timeline and up next; pops out into a full player",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "maxLabelWidth": 180
+    },
+    "schema": [
+      {
+        "key": "maxLabelWidth",
+        "type": "integer",
+        "label": "Max title width (px)",
+        "min": 0,
+        "max": 600,
+        "step": 10,
+        "defaultValue": 180
+      }
+    ]
+  },
+  "license": "MIT",
+  "repository": "https://github.com/V-EAGLE/omamp"
+}
