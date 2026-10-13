@@ -1,38 +1,57 @@
 #!/usr/bin/env python3
 """Apple Music bridge for the OmAmp Omarchy shell plugin.
 
-Runs music.apple.com as a Chromium web app with a private profile and the
-DevTools protocol on localhost, and drives the page's MusicKit instance.
+Runs music.apple.com as a Chromium web app with a private profile and drives
+the page's MusicKit instance over the Chrome DevTools Protocol (CDP).
 
-Protocol (newline-delimited JSON):
-  stdin   {"cmd": "<name>", "args": {...}, "id": <optional int>}
-  stdout  {"type": "status"|"state"|"queue"|"result"|"error", ...}
+There is no DevTools TCP port. Two processes:
 
-Stdlib only. Chromium keeps running when the bridge exits, so a shell restart
-reconnects to the same session without interrupting playback.
+  amctl.py daemon   Long-lived, detached from the shell. Starts Chromium with
+                    --remote-debugging-pipe, so CDP exists only as a pipe
+                    inherited by this process, and relays CDP requests from a
+                    Unix socket in $XDG_RUNTIME_DIR/omamp/ (directory 0700,
+                    socket 0600). Every connection's peer UID is checked with
+                    SO_PEERCRED; only the owning user is served. The daemon
+                    exits when Chromium exits.
+  amctl.py bridge   Started by the shell. Talks to the daemon over that socket
+                    (verifying the daemon's UID too) and speaks newline JSON
+                    with the shell:
+                      stdin   {"cmd": "<name>", "args": {...}, "id": <optional int>}
+                      stdout  {"type": "status"|"state"|"queue"|"result"|"error", ...}
+
+Chromium and the daemon survive a shell restart, so playback isn't
+interrupted; the new bridge reconnects to the same socket. Stdlib only.
 """
 
-import base64
+import fcntl
 import json
 import os
 import queue
+import re
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
 
-PORT = int(os.environ.get("AM_DEBUG_PORT", "9339"))
 URL = "https://music.apple.com/"
 WM_CLASS = "apple-music-web"
 SPECIAL = "applemusic"
 DATA_HOME = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 DATA = os.path.join(DATA_HOME, "omamp")
 PROFILE = os.path.join(DATA, "chromium")
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "omamp")
+SOCKET_PATH = os.path.join(RUNTIME, "cdp.sock")
+LOCK_PATH = os.path.join(RUNTIME, "daemon.lock")
 POLL = 0.5
+
+# Values that end up inside page JavaScript or Apple API paths.
+SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+QUEUE_KINDS = {"song", "songs", "album", "playlist", "station"}
+CONTAINER_TYPES = {"library-playlists", "library-albums", "library-artists", "albums", "playlists", "artists"}
 
 
 def emit(obj):
@@ -43,88 +62,93 @@ def emit(obj):
         os._exit(0)
 
 
-# ---------------------------------------------------------------- websocket
+def safe_id(value):
+    value = str(value)
+    if not SAFE_ID.match(value):
+        raise ValueError("invalid id")
+    return value
 
 
-class WebSocket:
-    """Just enough RFC 6455 client for a localhost DevTools socket."""
+# ---------------------------------------------------------------- transport
 
-    def __init__(self, url):
-        rest = url.split("://", 1)[1]
-        hostport, path = rest.split("/", 1)
-        host, port = hostport.split(":")
-        self.sock = socket.create_connection((host, int(port)), timeout=10)
-        key = base64.b64encode(os.urandom(16)).decode()
-        req = (f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\nUpgrade: websocket\r\n"
-               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
-        self.sock.sendall(req.encode())
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("websocket handshake closed")
-            buf += chunk
-        head, self.pending = buf.split(b"\r\n\r\n", 1)
-        if b" 101 " not in head.split(b"\r\n", 1)[0]:
-            raise ConnectionError("websocket handshake refused: " + head.split(b"\r\n", 1)[0].decode())
 
-    def _read(self, n):
-        while len(self.pending) < n:
-            chunk = self.sock.recv(max(65536, n - len(self.pending)))
-            if not chunk:
-                raise ConnectionError("websocket closed")
-            self.pending += chunk
-        out, self.pending = self.pending[:n], self.pending[n:]
-        return out
+def secure_dir(path):
+    """Create `path` (0700) or make sure an existing one is ours and private."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise RuntimeError(f"refusing to use {path}: not a directory owned by this user")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(path, 0o700)
 
-    def _send_frame(self, opcode, payload):
-        header = bytearray([0x80 | opcode])
-        n = len(payload)
-        if n < 126:
-            header.append(0x80 | n)
-        elif n < 65536:
-            header.append(0x80 | 126)
-            header += struct.pack(">H", n)
-        else:
-            header.append(0x80 | 127)
-            header += struct.pack(">Q", n)
-        mask = os.urandom(4)
-        header += mask
-        body = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self.sock.sendall(bytes(header) + body)
 
-    def send(self, text):
-        self._send_frame(0x1, text.encode())
+def peer_uid(sock):
+    pid, uid, gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    return uid
 
-    def recv(self):
-        message = b""
+
+def recv_line(sock, buf):
+    """Return (line, rest) from a newline-delimited stream; line is None at EOF."""
+    while b"\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return None, b""
+        buf += chunk
+    line, rest = buf.split(b"\n", 1)
+    return line, rest
+
+
+class DaemonClient:
+    """CDP over the daemon's Unix socket. Both ends verify each other's UID."""
+
+    def __init__(self, timeout=30):
+        st = os.lstat(SOCKET_PATH)
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            raise ConnectionError("daemon socket is not owned by this user")
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        try:
+            self.sock.connect(SOCKET_PATH)
+            if peer_uid(self.sock) != os.getuid():
+                raise ConnectionError("daemon runs as another user")
+        except OSError:
+            self.sock.close()
+            raise
+        self.buf = b""
+        self.next_id = 0
+
+    def request(self, method, params=None, scope="page"):
+        self.next_id += 1
+        mid = self.next_id
+        msg = {"id": mid, "method": method, "params": params or {}, "scope": scope}
+        self.sock.sendall(json.dumps(msg, separators=(",", ":")).encode() + b"\n")
         while True:
-            b1, b2 = self._read(2)
-            opcode = b1 & 0x0F
-            n = b2 & 0x7F
-            if n == 126:
-                n = struct.unpack(">H", self._read(2))[0]
-            elif n == 127:
-                n = struct.unpack(">Q", self._read(8))[0]
-            mask = self._read(4) if b2 & 0x80 else None
-            data = self._read(n)
-            if mask:
-                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-            if opcode == 0x8:
-                raise ConnectionError("websocket closed by peer")
-            if opcode == 0x9:
-                self._send_frame(0xA, data)
-                continue
-            if opcode in (0x0, 0x1, 0x2):
-                message += data
-                if b1 & 0x80:
-                    return message.decode("utf-8", "replace")
+            line, self.buf = recv_line(self.sock, self.buf)
+            if line is None:
+                raise ConnectionError("daemon closed the connection")
+            reply = json.loads(line)
+            if reply.get("id") == mid:
+                return reply
 
     def close(self):
         try:
             self.sock.close()
         except OSError:
             pass
+
+
+def daemon_info():
+    """{"pid", "page"} from a running daemon, or None."""
+    try:
+        client = DaemonClient(timeout=3)
+    except (OSError, ConnectionError):
+        return None
+    try:
+        return client.request("omamp.info", scope="daemon").get("result")
+    except (OSError, ConnectionError, ValueError):
+        return None
+    finally:
+        client.close()
 
 
 # ---------------------------------------------------------------- page JS
@@ -316,7 +340,7 @@ def js_command(cmd, a):
     if cmd == "previous":
         return "if (mk.currentPlaybackTime > 3) await mk.seekToTime(0); else await mk.skipToPreviousItem(); return true;"
     if cmd == "seek":
-        return f"await mk.seekToTime({float(a.get('time', 0))}); return true;"
+        return f"await mk.seekToTime({max(0.0, float(a.get('time', 0)))}); return true;"
     if cmd == "volume":
         return f"mk.volume = Math.max(0, Math.min(1, {float(a.get('value', 1))})); return true;"
     if cmd == "shuffle":
@@ -324,44 +348,47 @@ def js_command(cmd, a):
     if cmd == "repeat":
         return f"mk.repeatMode = {int(a.get('mode', 0))}; return true;"
     if cmd == "jump":
-        return f"await mk.changeToMediaAtIndex({int(a.get('index', 0))}); return true;"
+        return f"await mk.changeToMediaAtIndex({max(0, int(a.get('index', 0)))}); return true;"
     if cmd == "setQueue":
         # args: {kind: song|album|playlist|station|songs, id | ids, startWith, shuffle}
         kind = a.get("kind", "song")
-        opts = {kind: a.get("ids") if kind == "songs" else a.get("id")}
+        if kind not in QUEUE_KINDS:
+            raise ValueError("invalid queue kind")
+        if kind == "songs":
+            ids = a.get("ids")
+            if not isinstance(ids, list) or not ids:
+                raise ValueError("invalid ids")
+            opts = {kind: [safe_id(i) for i in ids[:500]]}
+        else:
+            opts = {kind: safe_id(a.get("id"))}
         if "startWith" in a:
-            opts["startWith"] = int(a["startWith"])
-        return (f"mk.shuffleMode = {int(a.get('shuffle', 0))}; await mk.setQueue({j(opts)}); "
+            opts["startWith"] = max(0, int(a["startWith"]))
+        return (f"mk.shuffleMode = {1 if int(a.get('shuffle', 0)) else 0}; await mk.setQueue({j(opts)}); "
                 "await mk.play(); return true;")
-    if cmd == "playNext":
-        return f"await mk.playNext({j({a.get('kind', 'song'): a.get('id')})}); return true;"
-    if cmd == "playLater":
-        return f"await mk.playLater({j({a.get('kind', 'song'): a.get('id')})}); return true;"
-    if cmd == "api":
-        return f"const r = await mk.api.music({j(a.get('path', ''))}, {j(a.get('params') or {})}); return r.data;"
-    if cmd == "rate":
-        # value: 1 love, -1 dislike, 0 clear
-        path = f"/v1/me/ratings/{a.get('kind', 'songs')}/{a.get('id')}"
-        val = int(a.get("value", 0))
-        if val == 0:
-            return f"await mk.api.music({j(path)}, {{}}, {{ fetchOptions: {{ method: 'DELETE' }} }}); return 0;"
-        body = j({"type": "rating", "attributes": {"value": val}})
-        return (f"await mk.api.music({j(path)}, {{}}, {{ fetchOptions: {{ method: 'PUT', "
-                f"headers: {{ 'Content-Type': 'application/json' }}, body: {j(body)} }} }}); return {val};")
+    if cmd in ("playNext", "playLater"):
+        kind = a.get("kind", "song")
+        if kind not in QUEUE_KINDS - {"songs"}:
+            raise ValueError("invalid queue kind")
+        return f"await mk.{cmd}({j({kind: safe_id(a.get('id'))})}); return true;"
     if cmd == "library":
-        path, limit, cap = LIBRARY_PATHS[a.get("section", "playlists")]
-        params = {"limit": limit}
-        size = 120 if a.get("section") == "songs" else 300
-        return (HELPERS_JS + f"const rows = await all({j(path)}, {j(params)}, {int(a.get('max', cap))}); "
+        section = a.get("section", "playlists")
+        if section not in LIBRARY_PATHS:
+            raise ValueError("invalid library section")
+        path, limit, cap = LIBRARY_PATHS[section]
+        size = 120 if section == "songs" else 300
+        return (HELPERS_JS + f"const rows = await all({j(path)}, {j({'limit': limit})}, {cap}); "
                 f"return rows.map(r => norm(r, {size}));")
     if cmd == "container":
-        return HELPERS_JS + f"const ARGS = {j(a)};" + CONTAINER_JS
+        if a.get("type") not in CONTAINER_TYPES:
+            raise ValueError("invalid container type")
+        args = {"type": a["type"], "id": safe_id(a.get("id"))}
+        return HELPERS_JS + f"const ARGS = {j(args)};" + CONTAINER_JS
     if cmd == "home":
         return HELPERS_JS + HOME_JS
     if cmd == "search":
-        return HELPERS_JS + f"const ARGS = {j(a)};" + SEARCH_JS
-    if cmd == "authorize":
-        return "await mk.authorize(); return true;"
+        args = {"term": str(a.get("term", ""))[:200],
+                "scope": "library" if a.get("scope") == "library" else "catalog"}
+        return HELPERS_JS + f"const ARGS = {j(args)};" + SEARCH_JS
     return None
 
 
@@ -386,23 +413,6 @@ DRM_JS = r"""
 # ---------------------------------------------------------------- browser
 
 
-def debug_targets():
-    with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json", timeout=1.5) as r:
-        return json.load(r)
-
-
-def find_page():
-    try:
-        targets = debug_targets()
-    except OSError:
-        return None
-    pages = [t for t in targets if t.get("type") == "page" and "webSocketDebuggerUrl" in t]
-    for t in pages:
-        if "music.apple.com" in t.get("url", ""):
-            return t
-    return pages[0] if pages else None
-
-
 def chromium_binary():
     for name in ("chromium", "google-chrome-stable", "brave"):
         path = shutil.which(name)
@@ -412,55 +422,228 @@ def chromium_binary():
 
 
 def launch_browser():
-    binary = chromium_binary()
-    if not binary:
+    """Start the daemon (which starts Chromium), fully detached from the shell."""
+    if not chromium_binary():
         emit({"type": "error", "message": "chromium not found"})
         return False
-    os.makedirs(PROFILE, exist_ok=True)
-    args = [
-        binary,
-        f"--user-data-dir={PROFILE}",
-        f"--remote-debugging-port={PORT}",
-        "--remote-debugging-address=127.0.0.1",
-        f"--class={WM_CLASS}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-background-timer-throttling",
-        "--disable-renderer-backgrounding",
-        "--disable-backgrounding-occluded-windows",
-        "--autoplay-policy=no-user-gesture-required",
-        f"--app={URL}",
-    ]
-    if os.environ.get("WAYLAND_DISPLAY"):
-        args.insert(1, "--ozone-platform=wayland")
-    launcher = ["uwsm-app", "--"] if shutil.which("uwsm-app") else []
-    subprocess.Popen(launcher + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "daemon"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
     return True
 
 
-def browser_pid():
-    """PID of the Chromium main process serving the DevTools port (0 if none).
+class BrowserDaemon:
+    """Owns Chromium's CDP pipe and serves it to same-user clients."""
 
-    Chromium names its MPRIS service org.mpris.MediaPlayer2.chromium.instance<PID>,
-    which lets the shell hide OmAmp's own browser from the generic sources.
-    """
-    flag = f"--remote-debugging-port={PORT}".encode()
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
+    def __init__(self):
+        self.write_lock = threading.Lock()
+        self.pending = {}            # browser message id -> [Event, reply]
+        self.pending_lock = threading.Lock()
+        self.next_id = 0
+        self.session = None
+        self.session_lock = threading.Lock()
+        self.proc = None
+        self.to_browser = None
+        self.from_browser = None
+
+    # -- Chromium --------------------------------------------------------
+
+    def start_browser(self):
+        binary = chromium_binary()
+        if not binary:
+            raise RuntimeError("chromium not found")
+        r1, w1 = os.pipe()  # daemon -> browser (browser fd 3)
+        r2, w2 = os.pipe()  # browser -> daemon (browser fd 4)
+
+        def child_fds():
+            # Move both ends out of the way first so dup2 can't clobber one.
+            a = fcntl.fcntl(r1, fcntl.F_DUPFD, 10)
+            b = fcntl.fcntl(w2, fcntl.F_DUPFD, 10)
+            os.dup2(a, 3)
+            os.dup2(b, 4)
+
+        args = [
+            binary,
+            f"--user-data-dir={PROFILE}",
+            "--remote-debugging-pipe",
+            f"--class={WM_CLASS}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--autoplay-policy=no-user-gesture-required",
+            f"--app={URL}",
+        ]
+        if os.environ.get("WAYLAND_DISPLAY"):
+            args.insert(1, "--ozone-platform=wayland")
+        # OMAMP_LOG=<file> keeps Chromium's output for debugging.
+        log = open(os.environ["OMAMP_LOG"], "ab") if os.environ.get("OMAMP_LOG") else subprocess.DEVNULL
+        self.proc = subprocess.Popen(args, pass_fds=(3, 4), preexec_fn=child_fds,
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        os.close(r1)
+        os.close(w2)
+        self.to_browser, self.from_browser = w1, r2
+
+    def browser_reader(self):
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(self.from_browser, 1 << 16)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            buf += chunk
+            while b"\0" in buf:
+                raw, buf = buf.split(b"\0", 1)
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                if "id" in msg:
+                    with self.pending_lock:
+                        slot = self.pending.pop(msg["id"], None)
+                    if slot:
+                        slot[1] = msg
+                        slot[0].set()
+                elif msg.get("method") in ("Target.detachedFromTarget", "Target.targetDestroyed"):
+                    with self.session_lock:
+                        self.session = None
+        # Pipe closed: Chromium is gone; wake everybody waiting.
+        with self.pending_lock:
+            for slot in self.pending.values():
+                slot[0].set()
+            self.pending.clear()
+
+    def browser_call(self, method, params=None, session=None, timeout=60):
+        with self.pending_lock:
+            self.next_id += 1
+            mid = self.next_id
+            slot = [threading.Event(), None]
+            self.pending[mid] = slot
+        msg = {"id": mid, "method": method, "params": params or {}}
+        if session:
+            msg["sessionId"] = session
+        data = json.dumps(msg, separators=(",", ":")).encode() + b"\0"
+        with self.write_lock:
+            view = memoryview(data)
+            while view:
+                n = os.write(self.to_browser, view)
+                view = view[n:]
+        if not slot[0].wait(timeout) or slot[1] is None:
+            with self.pending_lock:
+                self.pending.pop(mid, None)
+            raise ConnectionError(f"no reply to {method}")
+        return slot[1]
+
+    def page_session(self):
+        """Attach (flattened) to the Apple Music page target once and reuse it."""
+        with self.session_lock:
+            if self.session:
+                return self.session
+            targets = self.browser_call("Target.getTargets").get("result", {}).get("targetInfos", [])
+            pages = [t for t in targets if t.get("type") == "page"]
+            page = next((t for t in pages if "music.apple.com" in t.get("url", "")), pages[0] if pages else None)
+            if not page:
+                return None
+            reply = self.browser_call("Target.attachToTarget", {"targetId": page["targetId"], "flatten": True})
+            self.session = reply.get("result", {}).get("sessionId")
+            return self.session
+
+    # -- clients ---------------------------------------------------------
+
+    def serve_client(self, conn):
         try:
-            with open(f"/proc/{entry}/cmdline", "rb") as f:
-                raw = f.read()
+            if peer_uid(conn) != os.getuid():
+                return
+            conn.settimeout(None)
+            buf = b""
+            while True:
+                line, buf = recv_line(conn, buf)
+                if line is None:
+                    return
+                try:
+                    req = json.loads(line)
+                    cid = req["id"]
+                    method = str(req["method"])
+                    params = req.get("params") or {}
+                    scope = req.get("scope", "page")
+                except (ValueError, KeyError, TypeError):
+                    continue
+                try:
+                    if scope == "daemon" and method == "omamp.quit":
+                        # SIGTERM is Chromium's clean shutdown; CDP Browser.close
+                        # trips an internal assertion (SIGTRAP) in --app mode.
+                        self.proc.terminate()
+                        reply = {"result": {}}
+                    elif scope == "daemon" and method == "omamp.info":
+                        try:
+                            ready = self.page_session() is not None
+                        except ConnectionError:
+                            ready = False
+                        reply = {"result": {"pid": self.proc.pid, "page": ready}}
+                    elif scope == "browser":
+                        reply = self.browser_call(method, params)
+                    else:
+                        session = self.page_session()
+                        if not session:
+                            reply = {"error": {"message": "Apple Music page not ready"}}
+                        else:
+                            reply = self.browser_call(method, params, session=session)
+                            if reply.get("error") and "session" in str(reply["error"].get("message", "")).lower():
+                                with self.session_lock:
+                                    self.session = None
+                except ConnectionError as e:
+                    reply = {"error": {"message": str(e)}}
+                reply = dict(reply)
+                reply.pop("sessionId", None)
+                reply["id"] = cid
+                conn.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
         except OSError:
-            continue
-        # Chromium rewrites its argv into one space-separated string.
-        if flag not in raw or b"--type=" in raw:
-            continue
-        exe = os.path.basename(raw.replace(b"\0", b" ").split(b" ", 1)[0])
-        if b"chrom" in exe or b"brave" in exe:
-            return int(entry)
-    return 0
+            pass
+        finally:
+            conn.close()
+
+    def run(self):
+        secure_dir(RUNTIME)
+        lock = open(LOCK_PATH, "w")
+        os.chmod(LOCK_PATH, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # another daemon already owns the browser
+        secure_dir(DATA)
+        secure_dir(PROFILE)
+        self.start_browser()
+        threading.Thread(target=self.browser_reader, daemon=True).start()
+
+        try:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old_umask = os.umask(0o177)
+        try:
+            server.bind(SOCKET_PATH)
+        finally:
+            os.umask(old_umask)
+        os.chmod(SOCKET_PATH, 0o600)
+        server.listen(8)
+        server.settimeout(1.0)
+        try:
+            while self.proc.poll() is None:
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    continue
+                threading.Thread(target=self.serve_client, args=(conn,), daemon=True).start()
+        finally:
+            server.close()
+            try:
+                os.unlink(SOCKET_PATH)
+            except FileNotFoundError:
+                pass
 
 
 def widevine_downloaded():
@@ -487,15 +670,22 @@ def browser_window():
     return None
 
 
+def window_address(w):
+    addr = str(w.get("address", ""))
+    return addr if re.fullmatch(r"0x[0-9a-fA-F]+", addr) else None
+
+
 def hide_window():
     w = browser_window()
+    if w and not window_address(w):
+        return
     if w and not str(w.get("workspace", {}).get("name", "")).startswith("special:"):
         hypr_eval(f'hl.dispatch(hl.dsp.window.move({{ workspace = "special:{SPECIAL}", follow = false, window = "address:{w["address"]}" }}))')
 
 
 def show_window():
     w = browser_window()
-    if not w:
+    if not w or not window_address(w):
         return False
     name = str(w.get("workspace", {}).get("name", ""))
     if name.startswith("special:"):
@@ -510,8 +700,7 @@ def show_window():
 class Bridge:
     def __init__(self):
         self.commands = queue.Queue()
-        self.ws = None
-        self.msg_id = 0
+        self.ws = None   # DaemonClient while connected
         self.last_state = None
         self.last_queue_sig = None
         self.status = None
@@ -520,6 +709,7 @@ class Bridge:
         self.drm = None
         self.drm_checked_at = 0
         self.drm_restarted = False
+        self.drm_failures = 0
         self.pid = 0
 
     def set_status(self, **kw):
@@ -540,27 +730,22 @@ class Bridge:
         self.drm_checked_at = 0
 
     def connect(self):
-        page = find_page()
-        if not page:
+        if not os.path.exists(SOCKET_PATH):
             return False
         try:
-            self.ws = WebSocket(page["webSocketDebuggerUrl"])
-            self.ws.sock.settimeout(20)
-            self.pid = browser_pid()
-        except (OSError, ConnectionError) as e:
-            emit({"type": "error", "message": f"connect failed: {e}"})
-            self.ws = None
+            client = DaemonClient()
+            info = client.request("omamp.info", scope="daemon").get("result") or {}
+        except (OSError, ConnectionError, ValueError):
             return False
+        if not info.get("page"):
+            client.close()
+            return False
+        self.ws = client
+        self.pid = int(info.get("pid") or 0)
         return True
 
-    def call(self, method, params):
-        self.msg_id += 1
-        mid = self.msg_id
-        self.ws.send(json.dumps({"id": mid, "method": method, "params": params}))
-        while True:
-            msg = json.loads(self.ws.recv())
-            if msg.get("id") == mid:
-                return msg
+    def call(self, method, params, scope="page"):
+        return self.ws.request(method, params, scope=scope)
 
     def evaluate(self, expr, await_promise=False):
         res = self.call("Runtime.evaluate", {
@@ -584,7 +769,7 @@ class Bridge:
         rid = msg.get("id")
         try:
             if cmd == "launch":
-                if not find_page():
+                if not daemon_info():
                     self.hide_after_auth = bool(args.get("hidden", True))
                     self.launched_at = time.time()
                     launch_browser()
@@ -593,7 +778,7 @@ class Bridge:
                 result = True
             elif cmd == "showWeb":
                 result = show_window()
-                if not result and not find_page():
+                if not result and not daemon_info():
                     self.hide_after_auth = False
                     self.launched_at = time.time()
                     result = launch_browser()
@@ -603,7 +788,7 @@ class Bridge:
             elif cmd == "quit":
                 if self.ws:
                     try:
-                        self.call("Browser.close", {})
+                        self.call("omamp.quit", {}, scope="daemon")
                     except Exception:
                         pass
                 self.disconnect()
@@ -652,7 +837,10 @@ class Bridge:
             return
         self.drm_checked_at = time.time()
         self.drm = bool(self.evaluate(DRM_JS, True))
-        if not self.drm and widevine_downloaded() and not self.drm_restarted:
+        # EME can report "unsupported" for a moment while the page settles, so
+        # only a second failed check (15 s later) triggers the restart.
+        self.drm_failures = 0 if self.drm else self.drm_failures + 1
+        if self.drm_failures >= 2 and widevine_downloaded() and not self.drm_restarted:
             self.restart_browser()
 
     def restart_browser(self):
@@ -660,12 +848,12 @@ class Bridge:
         self.drm_restarted = True
         emit({"type": "error", "message": "restarting web player to load Widevine"})
         try:
-            self.call("Browser.close", {})
+            self.call("omamp.quit", {}, scope="daemon")
         except Exception:
             pass
         self.disconnect()
         for _ in range(40):
-            if not find_page():
+            if not os.path.exists(SOCKET_PATH):
                 break
             time.sleep(0.25)
         self.hide_after_auth = True
@@ -696,7 +884,7 @@ class Bridge:
 
             if not self.ws:
                 if not self.connect():
-                    self.set_status(browser=find_page() is not None or (time.time() - self.launched_at) < 15)
+                    self.set_status(browser=os.path.exists(SOCKET_PATH) or (time.time() - self.launched_at) < 15)
                     if msg:
                         self.handle(msg)
                     next_poll = time.time() + 1.0
@@ -717,6 +905,9 @@ class Bridge:
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "daemon":
+        BrowserDaemon().run()
+        return
     if len(sys.argv) > 1 and sys.argv[1] != "bridge":
         # One-shot CLI: amctl.py <cmd> ['{json args}']
         args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}

@@ -233,6 +233,7 @@ BarWidget {
               anchors.verticalCenter: parent.verticalCenter
               width: Style.space(18)
               horizontalAlignment: Text.AlignHCenter
+              textFormat: Text.PlainText
               text: srcRow.modelData.glyph
               color: srcRow.modelData.playing ? Color.accent : root.fg
               font.family: root.iconFont
@@ -605,6 +606,7 @@ BarWidget {
             anchors.right: parent.right
             anchors.rightMargin: Style.space(6)
             anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
             text: root.am ? root.am.formatTime(rowItem.modelData.duration) : ""
             color: root.dim
             font.family: root.iconFont

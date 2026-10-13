@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.v-eagle.omamp",
   "name": "OmAmp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "Vincenz Adler",
   "description": "OmAmp — a music player for the Omarchy bar: works with any MPRIS player (Spotify, Tidal, Amazon Music, Audible, YouTube Music, web players…) and adds queue, library and search for Apple Music",
   "kinds": [

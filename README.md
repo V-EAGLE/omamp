@@ -148,10 +148,16 @@ EOF
   launched and no network is used for this.
 - **Apple Music:** there is no Apple Music app for Linux, so OmAmp runs
   [music.apple.com](https://music.apple.com) as a Chromium web app and controls
-  it. `amctl.py` launches Chromium with its own profile and the DevTools
-  protocol enabled on `127.0.0.1:9339`, then drives the page's MusicKit player
-  (play, seek, queue, library and catalog requests). That browser also
-  publishes MPRIS, so OmAmp hides it to avoid a duplicate entry.
+  it through the Chrome DevTools Protocol (CDP), without any network port:
+  - `amctl.py daemon` starts Chromium with `--remote-debugging-pipe`, so CDP
+    exists only as a pipe inherited by that one process. The daemon runs
+    detached from the shell and exits when Chromium exits.
+  - `amctl.py bridge` (started by `Service.qml`) reaches the daemon through a
+    Unix socket at `$XDG_RUNTIME_DIR/omamp/cdp.sock` (directory `0700`,
+    socket `0600`). Both sides check the other's user ID with `SO_PEERCRED`.
+  - The bridge drives the page's MusicKit player (play, seek, queue, library
+    and catalog requests). That browser also publishes MPRIS, so OmAmp hides
+    it to avoid a duplicate entry.
 - `BarWidget.qml` (slim popup) and `Player.qml` (pop-out) bind to the active
   source's state from `Service.qml`.
 - The service launchers open the `spotify` or `tidal-hifi` app when installed,
@@ -169,13 +175,20 @@ Chromium keeps running when the shell restarts, so playback isn't interrupted.
 
 - Plugins run unsandboxed inside the Omarchy shell.
 - MPRIS control stays on your session bus; OmAmp doesn't open anything for it.
-- Apple Music only: the Chromium DevTools port listens on `127.0.0.1:9339`.
-  It can't be reached from other machines, but any program running as your
-  user can control that browser profile, including your signed-in Apple Music
-  session. Your sign-in is stored in a separate Chromium profile at
-  `~/.local/share/omamp/chromium`. OmAmp sends nothing anywhere except Apple
-  Music's own web player traffic. Set `appleMusic` to `false` to turn all of
-  this off.
+- Apple Music only: Chromium's DevTools are never exposed on a TCP port.
+  They're a pipe owned by OmAmp's daemon, reachable only through an
+  owner-only Unix socket that rejects every other user ID, so other accounts
+  on the machine can't control the signed-in browser or read its cookies.
+  Programs running as your own user can still reach it, just as they can read
+  your browser profiles anyway.
+- Your Apple Music sign-in is stored in a separate Chromium profile at
+  `~/.local/share/omamp/chromium`, which OmAmp keeps at `0700`. OmAmp sends
+  nothing anywhere except Apple Music's own web player traffic.
+- Everything sent to the page is validated first (IDs, page types, queue
+  kinds, search scope).
+- Set `appleMusic` to `false` to turn all of this off.
+
+See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Limitations
 

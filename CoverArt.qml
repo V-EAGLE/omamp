@@ -7,6 +7,8 @@ ClippingRectangle {
   id: root
 
   property string source: ""
+  // Artwork URLs come from any MPRIS player; only load ordinary image URLs.
+  readonly property string safeSource: /^(https?|file):\/\//i.test(source) ? source : ""
   property color placeholderColor: Util.alpha(Color.foreground, 0.08)
   property color glyphColor: Util.alpha(Color.foreground, 0.45)
   property string glyphFont: "monospace"
@@ -28,7 +30,7 @@ ClippingRectangle {
   Image {
     id: img
     anchors.fill: parent
-    source: root.source
+    source: root.safeSource
     fillMode: Image.PreserveAspectCrop
     asynchronous: true
     cache: true
